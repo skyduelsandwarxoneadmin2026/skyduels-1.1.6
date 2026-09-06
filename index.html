@@ -666,6 +666,20 @@
         <div class="store-product-list" id="promoList" style="margin-top:10px;"></div>
       </div>
       <div class="admin-card-form">
+        <h4>🔑 Change Admin Password</h4>
+        <p style="font-size:0.76rem;color:#555;margin:0 0 8px;">
+          Rotate the admin password. New password is saved to Firebase so it survives reloads.
+        </p>
+        <label>Current Password</label>
+        <input type="password" id="adminCurPass" placeholder="Current password">
+        <label>New Password</label>
+        <input type="password" id="adminNewPass" placeholder="At least 6 characters">
+        <label>Confirm New Password</label>
+        <input type="password" id="adminNewPass2" placeholder="Repeat new password">
+        <button id="changeAdminPassBtn">💾 Save New Password</button>
+        <p id="adminPassMsg" style="font-size:0.74rem;color:#2b7a2b;margin-top:6px;"></p>
+      </div>
+      <div class="admin-card-form">
         <h4>🐞 Debug Panel</h4>
         <p style="font-size:0.76rem;color:#555;margin:0 0 8px;">Live client state (refreshes when the panel opens).</p>
         <pre id="debugState" style="font-size:0.72rem;background:rgba(0,0,0,0.05);padding:8px;border-radius:8px;max-height:220px;overflow:auto;white-space:pre-wrap;"></pre>
@@ -708,7 +722,29 @@ const firebaseConfig = {
   measurementId: "G-EFPV1XJRWN"
 };
 
-const ADMIN_PASSWORD = "skyduelsforever2026!";
+// Default admin password is written to Firebase on the admin's first login so
+// it can be changed later from the Admin console. `adminPassword` is the live
+// value used for verification (defaults to this until the DB value is read).
+const ADMIN_PASSWORD_DEFAULT = "ChristmasSkyDuels2026";
+let adminPassword = ADMIN_PASSWORD_DEFAULT;
+
+// Loads admin/password from Firebase (or seeds the default once) so the admin
+// can change the password later and have it persist.
+async function ensureAdminConfig() {
+  try {
+    const snap = await get(ref(db, 'admin/password'));
+    if (snap.exists() && snap.val()) {
+      adminPassword = String(snap.val());
+    } else {
+      await update(ref(db, 'admin'), { password: ADMIN_PASSWORD_DEFAULT });
+      adminPassword = ADMIN_PASSWORD_DEFAULT;
+      debug('🔑 Admin password initialized.');
+    }
+  } catch (e) {
+    debug('⚠️ Admin password config: ' + (e && e.message));
+    adminPassword = ADMIN_PASSWORD_DEFAULT;
+  }
+}
 
 // Gift code redemption
 const GIFT_CODE = "vHTJCQXf4Na7VFLuBBVCdozgpwwo745H4ews9bquWvSYoP7hUx";
@@ -892,7 +928,7 @@ function escapeHtml(str) {
 function promptAdminPassword() {
   if (isAdmin) return true;
   const entered = prompt("Enter admin password:");
-  if (entered === ADMIN_PASSWORD) {
+  if (entered === adminPassword) {
     isAdmin = true;
     debug("👑 Admin access granted.");
     return true;
@@ -900,6 +936,18 @@ function promptAdminPassword() {
     alert("Incorrect password.");
   }
   return false;
+}
+
+// Persist a brand-new admin password (validated against the current one) so
+// admins can rotate it from the console without touching the code.
+async function saveNewAdminPassword(current, next) {
+  if (!isAdmin && !promptAdminPassword()) return false;
+  if (current !== adminPassword) { alert("Current password is incorrect."); return false; }
+  if (!next || next.length < 6) { alert("New password must be at least 6 characters."); return false; }
+  await update(ref(db, 'admin'), { password: next });
+  adminPassword = next;
+  debug('🔑 Admin password changed.');
+  return true;
 }
 
 function hideAdminPanel() {
@@ -969,17 +1017,20 @@ onAuthStateChanged(auth, async (user) => {
     document.getElementById('logoutBtn').style.display = 'inline-block';
     document.querySelector('.lobby-card')?.classList.add('active');
     await loadUserData();
+    await ensureAdminConfig();
     // The card cache may have been unavailable before login (DB requires auth).
     // Reload it now that we're authenticated and refresh all card-dependent UI.
     await loadCardCache();
     populateCardSelects();
     renderPromoCardPicker();
+    startSyncTick();
   } else {
     currentUser = null;
     playerStatus.textContent = '🔴 Logged out';
     statusBadge.textContent = "❌ Sign in required";
     document.getElementById('authControls').style.display = 'flex';
     document.getElementById('logoutBtn').style.display = 'none';
+    stopSyncTick();
     // Lock gameplay until the player signs in.
     if (currentRoom) {
       try { await leaveGame(); } catch (e) {}
@@ -1300,6 +1351,8 @@ async function leaveGame() {
   }
   currentRoom = null;
   aiProcessing = false;
+  aiBusySince = 0;
+  lastGameSig = '';
   gameSection.classList.remove('active');
   lobbySection.classList.add('active');
   updateToggleButtons();
@@ -1934,7 +1987,8 @@ async function seedAIPlayer(roomId, aiUid, aiSafe, mode) {
     await createDefaultCards();
     await loadCardCache();
   }
-  const aiLevel = 1; // fixed at Lv.1 (weakest) — the AI no longer draws its best deck
+  // Random level 1-5 so the AI's strength varies; higher levels get better planes.
+  const aiLevel = 1 + Math.floor(Math.random() * 5);
   // The two dragon cards are reserved for human players only — the AI must
   // never hold 東方巨龍 / 西方巨龍 (fusion requires both, which the AI can't do).
   const AI_BANNED_NAMES = ['東方巨龍', '西方巨龍'];
@@ -1944,32 +1998,47 @@ async function seedAIPlayer(roomId, aiUid, aiSafe, mode) {
     id, card: cardCache[id],
     power: (Number(cardCache[id].hp) || 0) + (Number(cardCache[id].dmg) || 0)
   }));
-  // ACTION CARDS: the AI only gets a couple (was every action card). This keeps
-  // its ban/debuff powers limited so it isn't overwhelming.
-  const aiActionCount = Math.min(caps.actionCap, 2);
+  // ACTION CARDS: the AI gets a couple at low levels, up to the cap at high levels.
+  const aiActionCount = Math.min(caps.actionCap, 1 + Math.floor(aiLevel / 2));
   const aiActions = shuffleArr(allCards.filter(c => (c.card.type || 'plane') === 'action')).slice(0, aiActionCount)
     .map(c => ({ cardId: c.id, hp: c.card.hp, dmg: c.card.dmg, skill: c.card.skill }));
-  // PLANES: the AI is restricted to Common / Rare planes only. This removes the
-  // high-tier Military jets and the largest airliners (Super Rare+), so its
-  // cards are on par with what a new player can afford — fixing "AI too strong".
-  const AI_ALLOWED_RARITIES = ['common', 'rare'];
+  // PLANES: rarity pool scales with the AI level. Low levels stay on Common/Rare
+  // (on par with a new player); higher levels unlock Super Rare and Mythic jets
+  // and airliners so the AI can field better planes.
+  const RARITY_BY_LEVEL = {
+    1: ['common', 'rare'],
+    2: ['common', 'rare'],
+    3: ['common', 'rare', 'super'],
+    4: ['common', 'rare', 'super', 'epic'],
+    5: ['common', 'rare', 'super', 'epic', 'mythic']
+  };
+  const AI_ALLOWED_RARITIES = RARITY_BY_LEVEL[aiLevel] || ['common', 'rare'];
   const planePool = allCards.filter(c =>
     (c.card.type || 'plane') !== 'action' &&
     AI_ALLOWED_RARITIES.includes((c.card.rarity || 'common').toLowerCase())
   );
   const aiPlaneCount = Math.min(caps.backupCap, planePool.length);
-  const chosen = shuffleArr(planePool).slice(0, aiPlaneCount);
+  // Higher levels pick the strongest planes from the pool; low levels pick random.
+  let chosen;
+  if (aiLevel >= 3) {
+    chosen = planePool.slice().sort((a, b) => b.power - a.power).slice(0, aiPlaneCount);
+  } else {
+    chosen = shuffleArr(planePool).slice(0, aiPlaneCount);
+  }
   const aiPlanes = chosen.map(c => ({ cardId: c.id, hp: c.card.hp, dmg: c.card.dmg, skill: c.card.skill }));
   await update(ref(db, `games/${roomId}/players/${aiSafe}`), {
     action: aiActions, backup: aiPlanes, field: [null, null, null, null, null], aiLevel
   });
-  debug(`🤖 AI seeded (Lv.${aiLevel}).`);
+  debug(`🤖 AI seeded (Lv.${aiLevel}, rarities: ${AI_ALLOWED_RARITIES.join('/')}).`);
 }
 
 // ============================================================
 // AI OPPONENT (auto-plays on its turn)
 // ============================================================
 let aiProcessing = false;
+// When the AI turn was last kicked off (used by the real-time watchdog to
+// detect an AI turn that got stuck mid-processing for a long time).
+let aiBusySince = 0;
 
 function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
 
@@ -1983,6 +2052,7 @@ function maybeRunAITurn() {
   if (!currentId || !currentId.startsWith('ai_')) return;
   if (aiProcessing) return;
   aiProcessing = true;
+  aiBusySince = Date.now();
   const roomId = currentRoom;
   debug("🤖 AI is taking its turn...");
   setTimeout(() => processAITurn(roomId), 1000);
@@ -2085,9 +2155,9 @@ async function processAITurn(roomId) {
 // are skipped for the AI to avoid invalid/no-op plays and stray alerts.
 const AI_ENEMY_SKILLS = [1, 2, 3, 4, 13, 14, 15, 16, 17, 20, 24];
 const AI_SELF_SKILLS  = [5, 6, 7, 8, 9, 10, 11, 12, 18, 21, 25, 26, 27];
-// Chance the AI deliberately skips its attack on a given turn (makes it less
-// aggressive). Set to 0 to always attack.
-const AI_ATTACK_SKIP_CHANCE = 0.25;
+// Chance the AI deliberately skips its attack on a given turn. The user asked
+// the AI to never hold back, so it always attacks (0).
+const AI_ATTACK_SKIP_CHANCE = 0;
 
 // Decide whether the AI uses a card skill this turn, then use one. The chance
 // scales with aiLevel (Lv.1 ~35%, Lv.5 ~95%), so level meaningfully changes how
@@ -2688,9 +2758,9 @@ async function checkWinCondition(roomRef) {
     for (const pid of eliminated) {
       await update(roomRef, { [`players/${pid}/isAlive`]: false });
       // Chaos Dungeon "spews out prizes" when a player is knocked out — the
-      // eliminated player still walks away with a consolation prize (up to 250).
+      // eliminated player still walks away with a consolation prize (5-20 SDC).
       if (isChaos && !pid.startsWith('ai_')) {
-        const prize = randInt(20, CHAOS_PRIZE_MAX);
+        const prize = randInt(5, 20);
         await awardCurrency(sanitizeKey(pid), prize, 'Chaos elimination prize');
       }
     }
@@ -3127,6 +3197,29 @@ document.getElementById('createPromoBtn').addEventListener('click', async () => 
   loadPromoList();
 });
 
+// Change the admin password (persisted to Firebase admin/password).
+document.getElementById('changeAdminPassBtn').addEventListener('click', async () => {
+  if (!isAdmin && !promptAdminPassword()) return;
+  const cur = document.getElementById('adminCurPass').value;
+  const n1 = document.getElementById('adminNewPass').value;
+  const n2 = document.getElementById('adminNewPass2').value;
+  const msgEl = document.getElementById('adminPassMsg');
+  if (cur !== adminPassword) { msgEl.textContent = '❌ Current password is incorrect.'; return; }
+  if (!n1 || n1.length < 6) { msgEl.textContent = '❌ New password must be at least 6 characters.'; return; }
+  if (n1 !== n2) { msgEl.textContent = '❌ New password and confirmation do not match.'; return; }
+  try {
+    const ok = await saveNewAdminPassword(cur, n1);
+    if (ok) {
+      msgEl.textContent = '✅ Admin password changed successfully.';
+      document.getElementById('adminCurPass').value = '';
+      document.getElementById('adminNewPass').value = '';
+      document.getElementById('adminNewPass2').value = '';
+    }
+  } catch (e) {
+    msgEl.textContent = '❌ Failed to save: ' + (e && e.message);
+  }
+});
+
 async function loadPromoList() {
   const list = document.getElementById('promoList');
   if (!list) return;
@@ -3481,12 +3574,22 @@ async function listCardOnMarket(cardId, handIdx) {
   const newHand = [...hand];
   newHand.splice(removeAt, 1);
   const price = cardResaleValue(cardId);
-  await update(userRef, { hand: newHand });
-  await push(ref(db, 'marketplace'), {
+  // Create the listing FIRST, then remove the card from the hand. This way a
+  // failed listing can never make your card silently disappear.
+  const listingRef = await push(ref(db, 'marketplace'), {
     sellerUid: safeUid,
     sellerName: `Player ${safeUid.slice(0, 6)}`,
     cardId, price, created: Date.now()
   });
+  try {
+    await update(userRef, { hand: newHand });
+  } catch (e) {
+    // Rollback: pull the listing back down so the card is never lost.
+    await remove(listingRef);
+    alert('❌ Listing failed — your card is safe.');
+    debug('⚠️ listCardOnMarket rollback: ' + (e && e.message));
+    return;
+  }
   alert(`🏪 Listed ${cardCache[cardId].name} on the Marketplace for 💰${price} SDC.`);
   debug(`🏪 Listed ${cardCache[cardId].name} for 💰${price}.`);
   renderMarketSellList();
@@ -3538,16 +3641,25 @@ async function buyMarketListing(key) {
   if (currency < l.price) return alert('Not enough SDC!');
   // Remove the listing FIRST so two buyers can't both purchase it.
   await remove(ref(db, `marketplace/${key}`));
-  await update(userRef, { currency: currency - l.price, hand: [...(u.hand || []), l.cardId] });
+  try {
+    await update(userRef, { currency: currency - l.price, hand: [...(u.hand || []), l.cardId] });
+    // Credit the seller's balance (works whether they're online or not).
+    const sellerRef = ref(db, `users/${l.sellerUid}`);
+    const sSnap = await get(sellerRef);
+    if (sSnap.exists()) {
+      await update(sellerRef, { currency: (Number(sSnap.val().currency) || 0) + l.price });
+    }
+    if (currentRoom) await update(ref(db, `games/${currentRoom}/players/${safeUid}`), { currency: currency - l.price });
+  } catch (e) {
+    // Rollback: restore the listing so a failed purchase never eats the card.
+    await set(ref(db, `marketplace/${key}`), { sellerUid: l.sellerUid, sellerName: l.sellerName, cardId: l.cardId, price: l.price, created: l.created });
+    alert('❌ Purchase failed — nothing was changed.');
+    debug('⚠️ buyMarketListing rollback: ' + (e && e.message));
+    renderMarketListings();
+    return;
+  }
   userCurrency = currency - l.price;
   updateCurrencyDisplay();
-  // Credit the seller's balance (works whether they're online or not).
-  const sellerRef = ref(db, `users/${l.sellerUid}`);
-  const sSnap = await get(sellerRef);
-  if (sSnap.exists()) {
-    await update(sellerRef, { currency: (Number(sSnap.val().currency) || 0) + l.price });
-  }
-  if (currentRoom) await update(ref(db, `games/${currentRoom}/players/${safeUid}`), { currency: userCurrency });
   alert(`✅ Bought ${cardCache[l.cardId]?.name || 'card'} for 💰${l.price} SDC!`);
   debug(`🏪 Bought ${cardCache[l.cardId]?.name} from ${l.sellerName} for 💰${l.price}.`);
   const badge = document.getElementById('marketCurrencyBadge');
@@ -3759,6 +3871,111 @@ document.getElementById('langToggle').addEventListener('click', () => {
   document.querySelectorAll('.buy-product-btn').forEach(btn => btn.textContent = t['Buy']);
   document.getElementById('shopToggle').textContent = '🛒 ' + t['Shop'];
 });
+
+// ============================================================
+// REAL-TIME SYNC TICK (every 3s)
+// ============================================================
+// The game uses an onValue listener for instant updates, but if the realtime
+// push channel ever hiccups (drops an update or a turn event), the board can
+// freeze and the marketplace/shop can look stale. This 3-second poll acts as
+// a watchdog: it re-reads the room + user node and re-runs the same pipeline
+// the listener uses whenever the snapshot actually changed, plus it restarts
+// an AI turn that got stuck for more than 30 seconds.
+let syncInterval = null;
+let lastGameSig = '';
+
+function startSyncTick() {
+  if (syncInterval) return;
+  syncInterval = setInterval(runSyncTick, 3000);
+  debug('🔄 Real-time sync started (3s poll).');
+}
+function stopSyncTick() {
+  if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
+}
+
+// Lightweight fingerprint of a game snapshot; rendering only happens when it
+// changes, so the 3s poll never causes board flicker.
+function gameSignature(g) {
+  if (!g) return '';
+  const parts = [g.mode, g.status, g.currentTurnIndex, (g.turnOrder || []).join('|')];
+  const rows = [];
+  for (const pid of Object.keys(g.players || {})) {
+    const pl = g.players[pid];
+    const f = (Array.isArray(pl.field) ? pl.field.map(s => s ? `${s.cardId}:${s.hp}:${s.dmg}` : '_') : []).join(',');
+    rows.push([pid, pl.isAlive ? 1 : 0, f, (pl.backup || []).length, (pl.action || []).length, pl.frozen ? 1 : 0].join('|'));
+  }
+  parts.push(rows.join(';'));
+  return parts.join('@');
+}
+
+async function runSyncTick() {
+  if (!currentUser || !currentUser.uid) return;
+  const safeUid = sanitizeKey(currentUser.uid);
+  try {
+    // 1) Keep the player's own currency/hand in sync (rewards, trades,
+    //    other tabs/devices) so shop & marketplace prices stay accurate.
+    const uSnap = await get(ref(db, `users/${safeUid}`));
+    if (uSnap.exists()) {
+      const u = uSnap.val();
+      const dbCur = Number(u.currency) || 0;
+      if (dbCur !== (userCurrency || 0)) {
+        userCurrency = dbCur;
+        updateCurrencyDisplay();
+        const badge = document.getElementById('marketCurrencyBadge');
+        if (badge) badge.textContent = dbCur + ' SDC';
+      }
+    }
+
+    // In the lobby (no active room) the sync tick keeps the shop + marketplace
+    // fresh so players always see the latest listings/currency without reloading.
+    if (!currentRoom) {
+      if (marketPanel && marketPanel.classList.contains('active')) {
+        try { refreshStorePriceMap(); renderMarketListings(); renderMarketSellList(); renderSkyStock(); } catch (e) { /* non-fatal */ }
+      }
+      if (shopPanel && shopPanel.classList.contains('active')) {
+        try { loadShopProducts(); } catch (e) { /* non-fatal */ }
+      }
+      return;
+    }
+
+    // 2) Mirror the game listener's pipeline when the room snapshot changed.
+    try { await update(ref(db, `games/${currentRoom}/players/${safeUid}`), { currency: userCurrency || 0 }); } catch (e) { /* non-fatal */ }
+    const snap = await get(ref(db, `games/${currentRoom}`));
+    if (!snap.exists()) return;
+    gameData = snap.val();
+    const sig = gameSignature(gameData);
+    if (sig !== lastGameSig) {
+      lastGameSig = sig;
+      maybeRunAITurn();
+      try { await upgradeFieldData(currentRoom); } catch (e) { debug('⚠️ sync upgradeFieldData: ' + (e && e.message)); }
+      try { renderGame(); } catch (e) { debug('⚠️ sync renderGame: ' + (e && e.message)); }
+      try { updateTurnUI(); } catch (e) { debug('⚠️ sync updateTurnUI: ' + (e && e.message)); }
+      const mode = gameData.mode;
+      const playerCount = Object.keys(gameData.players).filter(pid => gameData.players[pid].isAlive).length;
+      if (mode === 'chaos' && playerCount >= 4 && gameData.status === 'waiting') {
+        await startChaosGame(currentRoom);
+      } else if ((mode === '5v5' || mode === '7v7') && playerCount === 2 && gameData.status === 'waiting') {
+        await startDuel(currentRoom);
+      }
+    } else {
+      // Nothing changed this tick, but still make sure the AI hasn't stalled.
+      const to = gameData.turnOrder || [];
+      const cur = to[gameData.currentTurnIndex || 0];
+      if (gameData.status === 'active' && cur && String(cur).startsWith('ai_')) {
+        if (aiProcessing && Date.now() - aiBusySince > 30000) {
+          aiProcessing = false;
+          debug('⚡ AI watchdog: AI turn stalled for 30s — restarting it.');
+          maybeRunAITurn();
+        } else if (!aiProcessing) {
+          aiBusySince = Date.now();
+          maybeRunAITurn();
+        }
+      }
+    }
+  } catch (e) {
+    debug('⚠️ sync tick: ' + (e && e.message));
+  }
+}
 
 // ============================================================
 // INIT
